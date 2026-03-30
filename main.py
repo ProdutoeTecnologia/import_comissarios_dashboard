@@ -29,8 +29,3 @@ Renomeia o seu script original para **`import_csv.py`** (provavelmente já está
 
 A estrutura da pasta deve ficar:
 ```
-/sua-pasta
-  ├── main.py
-  ├── import_csv.py
-  ├── requirements.txt
-  └── Procfile
