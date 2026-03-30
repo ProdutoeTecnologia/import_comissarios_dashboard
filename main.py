@@ -21,11 +21,3 @@ async def processar(file: UploadFile = File(...)):
         return {"status": "erro", "detalhe": str(e)}
     finally:
         os.unlink(tmp_path)
-```
-
----
-
-Renomeia o seu script original para **`import_csv.py`** (provavelmente já está assim).
-
-A estrutura da pasta deve ficar:
-```
