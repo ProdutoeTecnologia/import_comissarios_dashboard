@@ -118,7 +118,7 @@ def normalize_phone_parts(ddd_raw: Optional[str], celular_raw: Optional[str]) ->
         ddd = combined[:2]
         celular = combined[2:]
     elif ddd and len(combined) > len(ddd) and not celular:
-        celular = combined[len(ddd) :]
+        celular = combined[len(ddd):]
 
     if celular:
         if len(celular) > 9:
@@ -239,24 +239,52 @@ def ensure_comissario(client: Client, nome: str) -> Optional[str]:
     return str(inserted.data[0]["id"])
 
 
-def ensure_pessoa(client: Client, nome: str) -> Optional[str]:
+def ensure_pessoa(client: Client, nome: str, email: Optional[str] = None) -> Optional[str]:
+    """
+    Garante linha em `pessoas` para o comissário.
+
+    Estratégia de matching (em ordem de prioridade):
+    1. Lookup exato por nome (caso nominal).
+    2. Lookup por email — permite vincular mesmo quando o nome no CSV diverge
+       do cadastro (ex: "JOAO SILVA" vs "João da Silva").
+    3. Criação de nova linha com nome + email (se fornecido).
+    """
     nome = normalize_comissario_nome(nome)
     if not nome:
         return None
 
-    existing = (
+    # 1. Lookup por nome exato
+    by_nome = (
         client.table("pessoas")
         .select("id")
         .eq("nome", nome)
         .limit(1)
         .execute()
     )
-    if existing.data:
-        return str(existing.data[0]["id"])
+    if by_nome.data:
+        return str(by_nome.data[0]["id"])
+
+    # 2. Lookup por email (fallback para quando o nome diverge)
+    email_norm = normalize_email(email)
+    if email_norm:
+        by_email = (
+            client.table("pessoas")
+            .select("id")
+            .ilike("email", email_norm)
+            .limit(1)
+            .execute()
+        )
+        if by_email.data:
+            return str(by_email.data[0]["id"])
+
+    # 3. Cria nova pessoa com nome + email (se disponível)
+    payload: Dict[str, object] = {"nome": nome, "tipo": None, "ativo": True}
+    if email_norm:
+        payload["email"] = email_norm
 
     inserted = (
         client.table("pessoas")
-        .insert({"nome": nome, "tipo": None, "ativo": True})
+        .insert(payload)
         .execute()
     )
     if not inserted.data:
@@ -415,6 +443,8 @@ def import_csv(path: str) -> None:
     rows_skipped_no_registro = 0
     rows_skipped_no_comissario = 0
     rows_skipped_atendimento = 0
+    # ── NOVO ── vendas corporativas aproveitadas via campo "Corporativo"
+    rows_corporativo_used = 0
     groups: Dict[Tuple[str, str], Dict[str, object]] = {}
     hoje = datetime.now().date()
     limite_cancelamento = hoje - timedelta(days=1)
@@ -426,14 +456,28 @@ def import_csv(path: str) -> None:
             total_rows_read += 1
             registro = (row.get("Registro") or "").strip()
             comissario_raw = (row.get("Comissario") or "").strip()
+            # ── NOVO ── lê campo Corporativo como fallback
+            corporativo_raw = (row.get("Corporativo") or "").strip()
             produto = (row.get("Produto") or "").strip()
+
+            # Coluna opcional: email do comissário (para matching por email como fallback)
+            comissario_email_raw = (row.get("ComissarioEmail") or row.get("Comissario_Email") or "").strip()
 
             if not registro:
                 rows_skipped_no_registro += 1
                 continue
+
+            # ── ALTERADO ──
+            # Antes: se comissario_raw vazio → descartava sempre.
+            # Agora: se comissario_raw vazio MAS corporativo_raw preenchido → usa corporativo.
             if not comissario_raw:
-                rows_skipped_no_comissario += 1
-                continue
+                if corporativo_raw:
+                    comissario_raw = corporativo_raw
+                    rows_corporativo_used += 1
+                else:
+                    rows_skipped_no_comissario += 1
+                    continue
+
             if comissario_raw.upper() == "ATENDIMENTO":
                 rows_skipped_atendimento += 1
                 continue
@@ -447,10 +491,17 @@ def import_csv(path: str) -> None:
 
             if group_key not in groups:
                 base = process_row(row)
+                # Se veio do campo Corporativo, sobrescreve o comissario_nome
+                # (process_row leu o campo "Comissario" que estava vazio)
+                if corporativo_raw and not (row.get("Comissario") or "").strip():
+                    base["comissario_nome"] = normalize_comissario_nome(corporativo_raw)
                 base["subtotal"] = subtotal
                 base["descontos"] = descontos
                 base["valor_final"] = valor_final
                 base["status"] = status
+                base["corporativo"] = bool(corporativo_raw)
+                # Email do comissário (coluna opcional no CSV — não vai para a tabela vendas)
+                base["comissario_email"] = normalize_email(comissario_email_raw) if comissario_email_raw else None
                 groups[group_key] = base
             else:
                 group = groups[group_key]
@@ -458,6 +509,9 @@ def import_csv(path: str) -> None:
                 group["descontos"] = float(group.get("descontos", 0.0)) + descontos
                 group["valor_final"] = float(group.get("valor_final", 0.0)) + valor_final
                 pr = process_row(row)
+                # Se veio do Corporativo, corrige o comissario_nome no pr também
+                if corporativo_raw and not (row.get("Comissario") or "").strip():
+                    pr["comissario_nome"] = normalize_comissario_nome(corporativo_raw)
                 group.update(_scalar_fields_from_process_row(pr))
 
     total_unique = len(groups)
@@ -472,8 +526,9 @@ def import_csv(path: str) -> None:
     for group in groups.values():
         _finalize_group(group, limite_cancelamento)
         comissario_nome = str(group.get("comissario_nome") or "")
+        comissario_email = group.get("comissario_email") or None
         group["comissario_id"] = ensure_comissario(client, comissario_nome)
-        group["pessoa_id"] = ensure_pessoa(client, comissario_nome)
+        group["pessoa_id"] = ensure_pessoa(client, comissario_nome, email=comissario_email)
         group["cliente_id"] = ensure_cliente(
             client=client,
             nome=group.get("nome_comprador"),
@@ -486,7 +541,9 @@ def import_csv(path: str) -> None:
         )
         group["importado_em"] = importado_em
 
-        batch.append(_to_upsert_row(group))
+        # comissario_email é campo interno (matching apenas) — não vai para a tabela vendas
+        upsert_group = {k: v for k, v in group.items() if k != "comissario_email"}
+        batch.append(_to_upsert_row(upsert_group))
         if len(batch) >= UPSERT_BATCH_SIZE:
             w, err = _upsert_batch(client, batch, error_samples)
             total_written += w
@@ -504,6 +561,7 @@ def import_csv(path: str) -> None:
         f"skipped_no_registro={rows_skipped_no_registro}",
         f"skipped_no_comissario={rows_skipped_no_comissario}",
         f"skipped_atendimento={rows_skipped_atendimento}",
+        f"corporativo_used={rows_corporativo_used}",
     ]
     if error_samples:
         notes_parts.append("errors_sample: " + " | ".join(error_samples)[:4000])
@@ -516,6 +574,8 @@ def import_csv(path: str) -> None:
     print(f"Vendas únicas (registro+produto) processadas: {total_unique}")
     print(f"Gravações bem-sucedidas (linhas enviadas ao upsert): {total_written}")
     print(f"Erros: {total_errors}")
+    if rows_corporativo_used:
+        print(f"Vendas corporativas importadas via campo Corporativo: {rows_corporativo_used}")
     if rows_skipped_no_registro or rows_skipped_no_comissario or rows_skipped_atendimento:
         print(
             f"(Ignoradas: sem registro={rows_skipped_no_registro}, "
@@ -539,12 +599,45 @@ def import_csv(path: str) -> None:
         print(f"Aviso: não foi possível gravar import_logs ({log_err!s}). Aplique a migration add_import_logs.sql se necessário.")
 
 
+def revalidate_next_cache(base_url: Optional[str], secret: Optional[str]) -> None:
+    """
+    Invalida o cache do Next.js chamando POST /api/backoffice/revalidate.
+    Requer NEXT_PUBLIC_APP_URL (ou APP_URL) e REVALIDATE_SECRET no ambiente.
+    Falha silenciosa — não interrompe o import.
+    """
+    if not base_url:
+        print("Aviso: NEXT_PUBLIC_APP_URL/APP_URL não definido — cache do Next.js não foi invalidado.")
+        return
+
+    try:
+        import urllib.request as urllib_req
+        import urllib.error
+        import json as json_mod
+
+        url = base_url.rstrip("/") + "/api/backoffice/revalidate"
+        headers = {"Content-Type": "application/json"}
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
+
+        req = urllib_req.Request(url, data=b"{}", headers=headers, method="POST")
+        with urllib_req.urlopen(req, timeout=10) as resp:
+            body = json_mod.loads(resp.read())
+            print(f"Cache Next.js invalidado: {body.get('revalidated', [])}")
+    except Exception as e:
+        print(f"Aviso: falha ao invalidar cache Next.js ({e!s}). As mudanças aparecerão em até 60 s.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Importa CSV de vendas para Supabase (upsert idempotente).")
     parser.add_argument("csv_path", help="Caminho para o arquivo CSV (FunPlace)")
     args = parser.parse_args()
     try:
         import_csv(args.csv_path)
+
+        # Invalida cache do Next.js para que novos dados apareçam imediatamente
+        app_url = os.getenv("NEXT_PUBLIC_APP_URL") or os.getenv("APP_URL")
+        revalidate_secret = os.getenv("REVALIDATE_SECRET")
+        revalidate_next_cache(app_url, revalidate_secret)
     except Exception:
         traceback.print_exc()
         raise
