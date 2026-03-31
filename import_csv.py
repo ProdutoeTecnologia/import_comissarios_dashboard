@@ -541,8 +541,9 @@ def import_csv(path: str) -> None:
         )
         group["importado_em"] = importado_em
 
-        # comissario_email é campo interno (matching apenas) — não vai para a tabela vendas
-        upsert_group = {k: v for k, v in group.items() if k != "comissario_email"}
+        # comissario_email e corporativo são campos internos (matching/controle apenas)
+        # a tabela vendas não possui essas colunas — removidos antes do upsert
+        upsert_group = {k: v for k, v in group.items() if k not in ("comissario_email", "corporativo")}
         batch.append(_to_upsert_row(upsert_group))
         if len(batch) >= UPSERT_BATCH_SIZE:
             w, err = _upsert_batch(client, batch, error_samples)
