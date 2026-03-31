@@ -455,10 +455,12 @@ def import_csv(path: str) -> None:
         for row in reader:
             total_rows_read += 1
             registro = (row.get("Registro") or "").strip()
-            comissario_raw = (row.get("Comissario") or "").strip()
+            comissario_cell = (row.get("Comissario") or "").strip()
+            comissario_raw = comissario_cell
             # ── NOVO ── lê campo Corporativo como fallback
             corporativo_raw = (row.get("Corporativo") or "").strip()
             produto = (row.get("Produto") or "").strip()
+            attrib_from_corporativo = False
 
             # Coluna opcional: email do comissário (para matching por email como fallback)
             comissario_email_raw = (row.get("ComissarioEmail") or row.get("Comissario_Email") or "").strip()
@@ -468,19 +470,24 @@ def import_csv(path: str) -> None:
                 continue
 
             # ── ALTERADO ──
-            # Antes: se comissario_raw vazio → descartava sempre.
-            # Agora: se comissario_raw vazio MAS corporativo_raw preenchido → usa corporativo.
+            # Antes: se comissario_raw vazio → descartava; ATENDIMENTO → descartava sempre.
+            # Agora: usa Corporativo quando Comissario vazio OU quando Comissario é ATENDIMENTO.
             if not comissario_raw:
                 if corporativo_raw:
                     comissario_raw = corporativo_raw
                     rows_corporativo_used += 1
+                    attrib_from_corporativo = True
                 else:
                     rows_skipped_no_comissario += 1
                     continue
-
-            if comissario_raw.upper() == "ATENDIMENTO":
-                rows_skipped_atendimento += 1
-                continue
+            elif comissario_raw.upper() == "ATENDIMENTO":
+                if corporativo_raw:
+                    comissario_raw = corporativo_raw
+                    rows_corporativo_used += 1
+                    attrib_from_corporativo = True
+                else:
+                    rows_skipped_atendimento += 1
+                    continue
 
             status = (row.get("StatusPedido") or "").strip()
             subtotal = parse_money(row.get("SubTotal"))
@@ -491,9 +498,8 @@ def import_csv(path: str) -> None:
 
             if group_key not in groups:
                 base = process_row(row)
-                # Se veio do campo Corporativo, sobrescreve o comissario_nome
-                # (process_row leu o campo "Comissario" que estava vazio)
-                if corporativo_raw and not (row.get("Comissario") or "").strip():
+                # process_row lê só "Comissario" do CSV; quando o vendedor veio de Corporativo, corrige aqui.
+                if attrib_from_corporativo:
                     base["comissario_nome"] = normalize_comissario_nome(corporativo_raw)
                 base["subtotal"] = subtotal
                 base["descontos"] = descontos
@@ -509,8 +515,7 @@ def import_csv(path: str) -> None:
                 group["descontos"] = float(group.get("descontos", 0.0)) + descontos
                 group["valor_final"] = float(group.get("valor_final", 0.0)) + valor_final
                 pr = process_row(row)
-                # Se veio do Corporativo, corrige o comissario_nome no pr também
-                if corporativo_raw and not (row.get("Comissario") or "").strip():
+                if attrib_from_corporativo:
                     pr["comissario_nome"] = normalize_comissario_nome(corporativo_raw)
                 group.update(_scalar_fields_from_process_row(pr))
 
