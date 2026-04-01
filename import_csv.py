@@ -51,6 +51,22 @@ def normalize_comissario_nome(value: Optional[str]) -> str:
     return (value or "").strip().title()
 
 
+def corporativo_csv_to_bool(raw: Optional[str]) -> bool:
+    """
+    Coluna Corporativo do CSV: vazio → False; marcadores explícitos de não → False;
+    qualquer outro texto (empresa, Sim, 1, …) → True.
+
+    Evita bool("N") == True em Python (string não vazia) quando o export usa N/S.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if low in ("n", "nao", "não", "false", "f", "0", "na", "no", "-"):
+        return False
+    return True
+
+
 def normalize_forma_pagamento(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -253,11 +269,12 @@ def ensure_pessoa(client: Client, nome: str, email: Optional[str] = None) -> Opt
     if not nome:
         return None
 
-    # 1. Lookup por nome exato
+    # 1. Lookup por nome (case-insensitive — evita falso-negativo quando o CSV tem
+    #    casing diferente do cadastro, ex: "Joao Da Silva" vs "João da Silva").
     by_nome = (
         client.table("pessoas")
         .select("id")
-        .eq("nome", nome)
+        .ilike("nome", nome)
         .limit(1)
         .execute()
     )
@@ -278,7 +295,8 @@ def ensure_pessoa(client: Client, nome: str, email: Optional[str] = None) -> Opt
             return str(by_email.data[0]["id"])
 
     # 3. Cria nova pessoa com nome + email (se disponível)
-    payload: Dict[str, object] = {"nome": nome, "tipo": None, "ativo": True}
+    # `sem_tipo`: aparece na aba Comissários como "ainda não classificado" — evita NULL na coluna.
+    payload: Dict[str, object] = {"nome": nome, "tipo": "sem_tipo", "ativo": True}
     if email_norm:
         payload["email"] = email_norm
 
@@ -505,7 +523,7 @@ def import_csv(path: str) -> None:
                 base["descontos"] = descontos
                 base["valor_final"] = valor_final
                 base["status"] = status
-                base["corporativo"] = bool(corporativo_raw)
+                base["corporativo"] = corporativo_csv_to_bool(corporativo_raw)
                 # Email do comissário (coluna opcional no CSV — não vai para a tabela vendas)
                 base["comissario_email"] = normalize_email(comissario_email_raw) if comissario_email_raw else None
                 groups[group_key] = base
@@ -518,6 +536,10 @@ def import_csv(path: str) -> None:
                 if attrib_from_corporativo:
                     pr["comissario_nome"] = normalize_comissario_nome(corporativo_raw)
                 group.update(_scalar_fields_from_process_row(pr))
+                # Primeira linha podia vir sem Corporativo; linhas seguintes do mesmo
+                # registro+produto passam a marcar a venda como corporativa.
+                prev_corp = bool(group.get("corporativo"))
+                group["corporativo"] = prev_corp or corporativo_csv_to_bool(corporativo_raw)
 
     total_unique = len(groups)
     total_written = 0
@@ -546,9 +568,9 @@ def import_csv(path: str) -> None:
         )
         group["importado_em"] = importado_em
 
-        # comissario_email e corporativo são campos internos (matching/controle apenas)
-        # a tabela vendas não possui essas colunas — removidos antes do upsert
-        upsert_group = {k: v for k, v in group.items() if k not in ("comissario_email", "corporativo")}
+        # comissario_email é campo interno (matching apenas) — não existe na tabela vendas.
+        # corporativo agora é gravado na tabela (coluna booleana) — não removido aqui.
+        upsert_group = {k: v for k, v in group.items() if k not in ("comissario_email",)}
         batch.append(_to_upsert_row(upsert_group))
         if len(batch) >= UPSERT_BATCH_SIZE:
             w, err = _upsert_batch(client, batch, error_samples)
